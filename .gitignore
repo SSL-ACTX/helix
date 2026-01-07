@@ -1,0 +1,14 @@
+/target
+target/
+**/*.rs.bk
+*.pdb
+*.fasta
+*.tmp
+*.data
+*.bin
+.DS_Store
+auto_test.py
+__pycache__/
+bak/
+output.*
+*.jpg
