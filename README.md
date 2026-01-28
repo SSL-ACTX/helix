@@ -28,7 +28,7 @@ Unlike simple transcoders, Helix implements a full "Systems Storage" stack, hand
 ## 🚀 Key Capabilities
 
 ### ⚡ Performance & Scale
-* **Smart Streaming Architecture:** * **Constant Memory Footprint:** Processes files in **4MB streaming chunks**. This allows archiving multi-terabyte datasets with a minimal RAM footprint (~80MB peak), preventing OOM crashes even on constrained legacy hardware.
+* **Smart Streaming Architecture:** * **Constant Memory Footprint:** Processes files in **4MB streaming chunks**. This allows archiving multi-gigabyte datasets with a minimal RAM footprint (~80MB peak), preventing OOM crashes even on constrained legacy hardware.
     * **Memory-Aware Backpressure:** The batch iterator monitors byte usage, not just line counts, ensuring "DNA Soup" files (massive single lines or many small lines) never exhaust physical RAM.
 * **Massively Parallel:** Utilizes `Rayon` to parallelize CRC hashing, Reed-Solomon encoding, DNA translation, search filtering, and decay simulation across all available CPU cores (`-j` flag).
 * **Zstd Compression:** Applies Zstandard (Level 3) compression before encoding to maximize the *Bits-per-Molecule* density.
