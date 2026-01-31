@@ -2,7 +2,7 @@
 
 ![Helix Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:00ff&height=220&section=header&text=Helix&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=-2&stroke=00ffff&strokeWidth=2&desc=Systems-Level%20DNA%20Storage%20Archiver&descSize=20&descAlignY=60)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge&logo=open-source-initiative)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=for-the-badge&logo=open-source-initiative)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/Rust-Latest-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow.svg?style=for-the-badge)]()
 [![Tests](https://img.shields.io/badge/Tests-Passed-success.svg?style=for-the-badge)]()
