@@ -18,11 +18,25 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, BufRead, BufReader};
 use std::path::PathBuf;
 use std::collections::HashMap;
-use std::borrow::Cow;
 use anyhow::{Result, Context};
 use rand::RngCore;
 use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::AeadInPlace};
 use crc32fast::Hasher;
+
+const HLX2_MAGIC: &[u8; 4] = b"HLX2";
+const HLX2_VERSION: u8 = 2;
+const HLX2_FLAG_ENCRYPTED: u8 = 0x1;
+const HLX2_CHUNK_SIZE: usize = 64 * 1024;
+
+fn derive_chunk_nonce(base: &[u8; 24], counter: u64) -> [u8; 24] {
+    let mut nonce = *base;
+    let mut tail = [0u8; 8];
+    tail.copy_from_slice(&nonce[16..24]);
+    let base_val = u64::from_le_bytes(tail);
+    let new_val = base_val.wrapping_add(counter);
+    nonce[16..24].copy_from_slice(&new_val.to_le_bytes());
+    nonce
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -112,11 +126,19 @@ fn main() -> Result<()> {
 
                     // Encryption is applied after payload is loaded into the master buffer
 
-                    // Step C: Header Construction
-                    // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
-                    let enc_len = compressed_len + if has_password { 16 } else { 0 };
+                    // Step C: Header Construction (HLX2)
+                    // Format: [Magic 4] [Ver 1] [Flags 1] [Chunk 4] [OrigLen 8] [EncLen 8]
+                    //         [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
+                    let chunk_count = (compressed_len + HLX2_CHUNK_SIZE - 1) / HLX2_CHUNK_SIZE;
+                    let enc_len = compressed_len + if has_password { chunk_count * 16 } else { 0 };
+                    let flags = if has_password { HLX2_FLAG_ENCRYPTED } else { 0u8 };
 
-                    let mut header = (bytes_read as u64).to_be_bytes().to_vec();
+                    let mut header = Vec::with_capacity(82);
+                    header.extend_from_slice(HLX2_MAGIC);
+                    header.push(HLX2_VERSION);
+                    header.push(flags);
+                    header.extend_from_slice(&(HLX2_CHUNK_SIZE as u32).to_be_bytes());
+                    header.extend_from_slice(&(bytes_read as u64).to_be_bytes());
                     header.extend_from_slice(&(enc_len as u64).to_be_bytes());
                     header.extend_from_slice(&global_salt);
                     header.extend_from_slice(&block_salt);
@@ -129,27 +151,48 @@ fn main() -> Result<()> {
                     let mut header_with_crc = header;
                     header_with_crc.extend_from_slice(&hdr_crc.to_be_bytes());
 
-                    // Build padded master buffer: [header_with_crc][payload][tag]
+                    // Build padded master buffer: [header_with_crc][payload...]
                     let total_len = header_with_crc.len() + enc_len;
                     let shard_size = (total_len + *data - 1) / *data;
                     let padded_len = shard_size * *data;
                     let mut master_buffer = vec![0u8; padded_len];
                     master_buffer[..header_with_crc.len()].copy_from_slice(&header_with_crc);
 
-                    // Read compressed payload into master buffer
+                    // Read compressed payload and optionally encrypt in chunks directly into master buffer
                     let mut temp_reader = File::open(&temp_path)?;
-                    let payload_offset = header_with_crc.len();
-                    let payload_end = payload_offset + compressed_len;
-                    temp_reader.read_exact(&mut master_buffer[payload_offset..payload_end])?;
+                    let mut chunk_buf = vec![0u8; HLX2_CHUNK_SIZE];
+                    let mut write_offset = header_with_crc.len();
+                    let mut chunk_index: u64 = 0;
 
-                    // Encrypt in place and append tag if needed
-                    if has_password {
+                    let cipher = if has_password {
                         let session_key = crypto::derive_session_key(&master_key, &block_salt);
-                        let cipher = XChaCha20Poly1305::new(&session_key);
-                        let nonce = XNonce::from_slice(&nonce_bytes);
-                        let tag = cipher.encrypt_in_place_detached(nonce, b"", &mut master_buffer[payload_offset..payload_end])
-                            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-                        master_buffer[payload_end..payload_end + 16].copy_from_slice(tag.as_slice());
+                        Some(XChaCha20Poly1305::new(&session_key))
+                    } else {
+                        None
+                    };
+
+                    loop {
+                        let read_len = temp_reader.read(&mut chunk_buf)?;
+                        if read_len == 0 { break; }
+
+                        if let Some(ref cipher) = cipher {
+                            let mut local = chunk_buf[..read_len].to_vec();
+                            let nonce_bytes = derive_chunk_nonce(&nonce_bytes, chunk_index);
+                            let nonce = XNonce::from_slice(&nonce_bytes);
+                            let tag = cipher.encrypt_in_place_detached(nonce, b"", &mut local)
+                                .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
+                            master_buffer[write_offset..write_offset + read_len].copy_from_slice(&local);
+                            master_buffer[write_offset + read_len..write_offset + read_len + 16]
+                                .copy_from_slice(tag.as_slice());
+                            write_offset += read_len + 16;
+                        } else {
+                            master_buffer[write_offset..write_offset + read_len]
+                                .copy_from_slice(&chunk_buf[..read_len]);
+                            write_offset += read_len;
+                        }
+
+                        chunk_index += 1;
                     }
 
                     let _ = fs::remove_file(&temp_path);
@@ -308,74 +351,132 @@ fn main() -> Result<()> {
 
                                 let rs = RedundancyManager::new(*data, *parity)?;
                                 if let Ok(raw_block) = rs.recover_file(rs_shards) {
-                                    // Parse Binary Header
-                                    // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
-                                    if raw_block.len() < 76 {
-                                        // Corrupted block, skip
-                                        continue;
-                                    }
+                                    // Parse Binary Header (HLX2 or legacy)
+                                    let (orig_len, enc_len, flags, chunk_size, global_salt, block_salt, nonce_arr, payload_offset, legacy_single_tag) =
+                                        if raw_block.len() >= 86 && &raw_block[0..4] == HLX2_MAGIC {
+                                            let version = raw_block[4];
+                                            if version != HLX2_VERSION { continue; }
+                                            let flags = raw_block[5];
+                                            let chunk_size = u32::from_be_bytes(raw_block[6..10].try_into()?) as usize;
+                                            let orig_len = u64::from_be_bytes(raw_block[10..18].try_into()?) as usize;
+                                            let enc_len = u64::from_be_bytes(raw_block[18..26].try_into()?) as usize;
+                                            let global_salt = &raw_block[26..42];
+                                            let block_salt = &raw_block[42..58];
+                                            let mut nonce_arr = [0u8; 24];
+                                            nonce_arr.copy_from_slice(&raw_block[58..82]);
+                                            let hdr_crc = u32::from_be_bytes(raw_block[82..86].try_into()?);
 
-                                    let orig_len = u64::from_be_bytes(raw_block[0..8].try_into()?) as usize;
-                                    let enc_len = u64::from_be_bytes(raw_block[8..16].try_into()?) as usize;
-
-                                    let global_salt = &raw_block[16..32];
-                                    let block_salt = &raw_block[32..48];
-                                    let nonce_bytes = &raw_block[48..72];
-                                    let hdr_crc = u32::from_be_bytes(raw_block[72..76].try_into()?);
-
-                                    let mut hdr_hasher = Hasher::new();
-                                    hdr_hasher.update(&raw_block[0..72]);
-                                    if hdr_hasher.finalize() != hdr_crc {
-                                        // Corrupted header, skip
-                                        continue;
-                                    }
-
-                                    let payload_end = 76usize.saturating_add(enc_len);
-                                    if payload_end > raw_block.len() {
-                                        // Corrupted length fields, skip
-                                        continue;
-                                    }
-                                    let payload_slice = &raw_block[76..payload_end];
-
-                                    // Decryption
-                                    let payload_bytes: Cow<'_, [u8]> = if let Some(pass) = password {
-                                        // Optimization: Only derive Master Key if needed
-                                        if cached_master_key.is_none() {
-                                            print!("[*] Deriving Master Key for decryption... ");
-                                            io::stdout().flush()?;
-                                            cached_master_key = Some(crypto::derive_master_key(pass, global_salt)?);
-                                            println!("Done.");
-                                        }
-
-                                        let master_key = cached_master_key.unwrap();
-                                        let session_key = crypto::derive_session_key(&master_key, block_salt);
-
-                                        let cipher = XChaCha20Poly1305::new(&session_key);
-                                        let nonce = XNonce::from_slice(nonce_bytes);
-                                        if payload_slice.len() < 16 {
-                                            anyhow::bail!("\n[!] SECURITY ERROR: Truncated payload for Block {}.", blk_id);
-                                        }
-                                        let mut buffer = payload_slice.to_vec();
-                                        let tag_offset = buffer.len() - 16;
-                                        let tag_bytes = buffer[tag_offset..].to_vec();
-                                        let tag = chacha20poly1305::Tag::from_slice(&tag_bytes);
-                                        buffer.truncate(tag_offset);
-                                        match cipher.decrypt_in_place_detached(nonce, b"", &mut buffer, tag) {
-                                            Ok(()) => Cow::Owned(buffer),
-                                            Err(_) => {
-                                                anyhow::bail!("\n[!] SECURITY ERROR: Decryption failed for Block {}.", blk_id);
+                                            let mut hdr_hasher = Hasher::new();
+                                            hdr_hasher.update(&raw_block[0..82]);
+                                            if hdr_hasher.finalize() != hdr_crc {
+                                                continue;
                                             }
+
+                                            (orig_len, enc_len, flags, chunk_size, global_salt, block_salt, nonce_arr, 86usize, false)
+                                        } else {
+                                            if raw_block.len() < 76 { continue; }
+                                            let orig_len = u64::from_be_bytes(raw_block[0..8].try_into()?) as usize;
+                                            let enc_len = u64::from_be_bytes(raw_block[8..16].try_into()?) as usize;
+                                            let global_salt = &raw_block[16..32];
+                                            let block_salt = &raw_block[32..48];
+                                            let mut nonce_arr = [0u8; 24];
+                                            nonce_arr.copy_from_slice(&raw_block[48..72]);
+                                            let hdr_crc = u32::from_be_bytes(raw_block[72..76].try_into()?);
+
+                                            let mut hdr_hasher = Hasher::new();
+                                            hdr_hasher.update(&raw_block[0..72]);
+                                            if hdr_hasher.finalize() != hdr_crc { continue; }
+
+                                            let flags = if password.is_some() { HLX2_FLAG_ENCRYPTED } else { 0u8 };
+                                            (orig_len, enc_len, flags, 0usize, global_salt, block_salt, nonce_arr, 76usize, true)
+                                        };
+
+                                    let payload_end = payload_offset.saturating_add(enc_len);
+                                    if payload_end > raw_block.len() {
+                                        continue;
+                                    }
+                                    let payload_slice = &raw_block[payload_offset..payload_end];
+
+                                    // Decryption (streamed to temp file when encrypted)
+                                    let decrypted_path = if flags & HLX2_FLAG_ENCRYPTED == HLX2_FLAG_ENCRYPTED {
+                                        if let Some(pass) = password {
+                                            if cached_master_key.is_none() {
+                                                print!("[*] Deriving Master Key for decryption... ");
+                                                io::stdout().flush()?;
+                                                cached_master_key = Some(crypto::derive_master_key(pass, global_salt)?);
+                                                println!("Done.");
+                                            }
+
+                                            let master_key = cached_master_key.unwrap();
+                                            let session_key = crypto::derive_session_key(&master_key, block_salt);
+                                            let cipher = XChaCha20Poly1305::new(&session_key);
+
+                                            let temp_dec_path = temp_dir.join(format!("dec_{}_{}.bin", blk_id, rand::random::<u64>()));
+                                            let mut out_dec = File::create(&temp_dec_path)?;
+
+                                            if legacy_single_tag {
+                                                if payload_slice.len() < 16 {
+                                                    anyhow::bail!("\n[!] SECURITY ERROR: Truncated payload for Block {}.", blk_id);
+                                                }
+                                                let mut buffer = payload_slice.to_vec();
+                                                let tag_offset = buffer.len() - 16;
+                                                let tag_bytes = buffer[tag_offset..].to_vec();
+                                                let tag = chacha20poly1305::Tag::from_slice(&tag_bytes);
+                                                buffer.truncate(tag_offset);
+                                                let nonce = XNonce::from_slice(&nonce_arr);
+                                                match cipher.decrypt_in_place_detached(nonce, b"", &mut buffer, tag) {
+                                                    Ok(()) => out_dec.write_all(&buffer)?,
+                                                    Err(_) => anyhow::bail!("\n[!] SECURITY ERROR: Decryption failed for Block {}.", blk_id),
+                                                }
+                                            } else {
+                                                let mut offset = 0usize;
+                                                let mut chunk_index: u64 = 0;
+                                                while offset < payload_slice.len() {
+                                                    if payload_slice.len().saturating_sub(offset) <= 16 {
+                                                        anyhow::bail!("\n[!] SECURITY ERROR: Truncated payload for Block {}.", blk_id);
+                                                    }
+
+                                                    let remaining = payload_slice.len() - offset;
+                                                    let is_last = remaining <= (chunk_size + 16);
+                                                    let cipher_len = if is_last { remaining - 16 } else { chunk_size };
+                                                    let tag_offset = offset + cipher_len;
+                                                    let tag = chacha20poly1305::Tag::from_slice(&payload_slice[tag_offset..tag_offset + 16]);
+
+                                                    let mut buffer = payload_slice[offset..tag_offset].to_vec();
+                                                    let nonce_bytes = derive_chunk_nonce(&nonce_arr, chunk_index);
+                                                    let nonce = XNonce::from_slice(&nonce_bytes);
+                                                    match cipher.decrypt_in_place_detached(nonce, b"", &mut buffer, tag) {
+                                                        Ok(()) => out_dec.write_all(&buffer)?,
+                                                        Err(_) => anyhow::bail!("\n[!] SECURITY ERROR: Decryption failed for Block {}.", blk_id),
+                                                    }
+
+                                                    offset = tag_offset + 16;
+                                                    chunk_index += 1;
+                                                }
+                                            }
+
+                                            Some(temp_dec_path)
+                                        } else {
+                                            anyhow::bail!("\n[!] SECURITY ERROR: Encrypted block without password for Block {}.", blk_id);
                                         }
                                     } else {
-                                        Cow::Borrowed(payload_slice)
+                                        None
                                     };
 
                                     // Decompression (streamed to disk, bounded by orig_len)
                                     let recovered_path = temp_dir.join(format!("recovered_{}.bin", blk_id));
                                     let mut out = File::create(&recovered_path)?;
-                                    let decoder = zstd::Decoder::new(payload_bytes.as_ref())?;
-                                    let mut limited = decoder.take(orig_len as u64);
-                                    io::copy(&mut limited, &mut out)?;
+                                    if let Some(dec_path) = decrypted_path {
+                                        let mut f = File::open(&dec_path)?;
+                                        let decoder = zstd::Decoder::new(&mut f)?;
+                                        let mut limited = decoder.take(orig_len as u64);
+                                        io::copy(&mut limited, &mut out)?;
+                                        let _ = fs::remove_file(&dec_path);
+                                    } else {
+                                        let decoder = zstd::Decoder::new(payload_slice)?;
+                                        let mut limited = decoder.take(orig_len as u64);
+                                        io::copy(&mut limited, &mut out)?;
+                                    }
 
                                     temp_bytes += orig_len;
 
