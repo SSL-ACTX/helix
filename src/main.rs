@@ -186,7 +186,7 @@ fn main() -> Result<()> {
         }
 
         // COMMAND: RESTORE (Decode)
-        Commands::Restore { input, output, tag, password, data, parity, primer_fwd, primer_rev } => {
+        Commands::Restore { input, output, tag, password, data, parity, primer_fwd, primer_rev, max_inflight, max_temp_mb } => {
             println!("[*] Reading DNA Stream from {}...", input);
 
             let primers_tuple = Oligo::resolve_primers(tag, primer_fwd.as_deref(), primer_rev.as_deref());
@@ -201,10 +201,17 @@ fn main() -> Result<()> {
 
             // Streaming State (disk-backed)
             let mut shard_counts: HashMap<u32, usize> = HashMap::new();
+            let mut shard_bytes: HashMap<u32, usize> = HashMap::new();
             let mut recovered_blocks: HashMap<u32, PathBuf> = HashMap::new();
+            let mut recovered_sizes: HashMap<u32, usize> = HashMap::new();
             let mut next_expected_block = 0u32;
             let mut shards_found = 0;
             let mut blocks_recovered = 0;
+
+            // Safety caps to prevent OOM/disk exhaustion during restore
+            let max_inflight_blocks = *max_inflight;
+            let max_temp_bytes = max_temp_mb.saturating_mul(1024 * 1024);
+            let mut temp_bytes: usize = 0;
 
             // Temp spool directory for shards and recovered blocks
             let temp_dir = PathBuf::from(format!("{}.helix_tmp", output));
@@ -239,6 +246,18 @@ fn main() -> Result<()> {
                             if wrote_new {
                                 let counter = shard_counts.entry(blk_id).or_insert(0);
                                 *counter += 1;
+                                let bytes = shard_bytes.entry(blk_id).or_insert(0);
+                                *bytes += data_shard.len();
+                                temp_bytes += data_shard.len();
+                            }
+
+                            // Enforce strict caps to avoid runaway disk usage
+                            let inflight = shard_counts.len() + recovered_blocks.len();
+                            if inflight > max_inflight_blocks {
+                                anyhow::bail!("[!] RESTORE HALT: Too many in-flight blocks ({}). Increase --max-inflight to proceed.", inflight);
+                            }
+                            if temp_bytes > max_temp_bytes {
+                                anyhow::bail!("[!] RESTORE HALT: Temp usage {} bytes exceeded cap {} bytes. Increase --max-temp-mb to proceed.", temp_bytes, max_temp_bytes);
                             }
 
                             // Check if we have enough shards to trigger Reed-Solomon
@@ -295,11 +314,17 @@ fn main() -> Result<()> {
                                     let mut limited = decoder.take(orig_len as u64);
                                     io::copy(&mut limited, &mut out)?;
 
+                                    temp_bytes += orig_len;
+
                                     // Cleanup shards on disk
+                                    if let Some(bytes) = shard_bytes.remove(&blk_id) {
+                                        temp_bytes = temp_bytes.saturating_sub(bytes);
+                                    }
                                     let _ = fs::remove_dir_all(&block_dir);
                                     shard_counts.remove(&blk_id);
 
                                     recovered_blocks.insert(blk_id, recovered_path);
+                                    recovered_sizes.insert(blk_id, orig_len);
                                     blocks_recovered += 1;
 
                                     print!("\r    -> Recovered Block {} ({} bytes)... ", blk_id, orig_len);
@@ -307,6 +332,9 @@ fn main() -> Result<()> {
 
                                     // Write ordered blocks to disk
                                     while let Some(path) = recovered_blocks.remove(&next_expected_block) {
+                                        if let Some(sz) = recovered_sizes.remove(&next_expected_block) {
+                                            temp_bytes = temp_bytes.saturating_sub(sz);
+                                        }
                                         let mut f = File::open(&path)?;
                                         io::copy(&mut f, &mut output_file)?;
                                         let _ = fs::remove_file(&path);

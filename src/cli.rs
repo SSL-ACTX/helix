@@ -101,6 +101,14 @@ pub enum Commands {
         /// Number of parity shards (K) used during compilation
         #[arg(long, default_value_t = 5, value_name = "K")]
         parity: usize,
+
+        /// Max in-flight blocks during restore (disk-backed cap)
+        #[arg(long, default_value_t = 256, value_name = "BLOCKS")]
+        max_inflight: usize,
+
+        /// Max temp usage during restore in MB (disk-backed cap)
+        #[arg(long, default_value_t = 2048, value_name = "MB")]
+        max_temp_mb: usize,
     },
 
     /// Simulate physical DNA decay (Strand Dropout and Mutations).
