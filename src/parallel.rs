@@ -46,7 +46,18 @@ impl ParallelProcessor {
             let finalized = Oligo::create_tagged(i as u32, &protected_shard, primers);
 
             // 3. Stability Analysis (GC% and Tm)
-            let stability = DnaMapper::analyze_stability(&finalized);
+            let mut stability = DnaMapper::analyze_stability(&finalized);
+
+            // 4. Primer Collision Check (payload must not contain primers)
+            let fp_len = primers.0.len();
+            let rp_len = primers.1.len();
+            if finalized.len() > fp_len + rp_len + ADDRESS_BASE_LEN {
+                let core = &finalized[fp_len..finalized.len() - rp_len];
+                let payload = &core[ADDRESS_BASE_LEN..];
+                if payload.contains(primers.0) || payload.contains(primers.1) {
+                    stability.is_stable = false;
+                }
+            }
 
             ShardResult {
                 index: i,
