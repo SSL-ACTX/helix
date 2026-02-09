@@ -21,18 +21,34 @@ impl RedundancyManager {
 
     /// Takes raw bytes and transforms them into a vector of equal-sized shards.
     pub fn encode_to_shards(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        // Calculate shard size (ceil(data_len / data_shards))
-        let shard_size = (data.len() + self.data_shards - 1) / self.data_shards;
+        self.encode_to_shards_with_header(&[], data)
+    }
+
+    /// Takes a header and payload and transforms them into a vector of equal-sized shards
+    /// without building an intermediate concatenated buffer.
+    pub fn encode_to_shards_with_header(&self, header: &[u8], payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let total_len = header.len() + payload.len();
+        if total_len == 0 {
+            return Ok(vec![vec![]; self.data_shards + self.parity_shards]);
+        }
+
+        // Calculate shard size (ceil(total_len / data_shards))
+        let shard_size = (total_len + self.data_shards - 1) / self.data_shards;
 
         // Create a master buffer padded with zeros to fit the matrix
         let mut master_buffer = vec![0u8; shard_size * self.data_shards];
-        master_buffer[..data.len()].copy_from_slice(data);
+        if !header.is_empty() {
+            master_buffer[..header.len()].copy_from_slice(header);
+        }
+        if !payload.is_empty() {
+            master_buffer[header.len()..header.len() + payload.len()].copy_from_slice(payload);
+        }
 
         // Split master buffer into chunks
         let mut shards: Vec<Vec<u8>> = master_buffer
-        .chunks_exact(shard_size)
-        .map(|chunk| chunk.to_vec())
-        .collect();
+            .chunks_exact(shard_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
 
         // Create empty parity shards
         for _ in 0..self.parity_shards {
@@ -42,6 +58,31 @@ impl RedundancyManager {
         // Apply Reed-Solomon Encoding
         self.engine.encode(&mut shards)?;
 
+        Ok(shards)
+    }
+
+    /// Encodes a pre-padded master buffer into data+parity shards without extra concatenation.
+    /// The buffer length must be a multiple of data_shards.
+    pub fn encode_from_padded_buffer(&self, buffer: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+        if buffer.is_empty() {
+            return Ok(vec![vec![]; self.data_shards + self.parity_shards]);
+        }
+
+        if buffer.len() % self.data_shards != 0 {
+            return Err(anyhow!("Padded buffer length must be divisible by data_shards"));
+        }
+
+        let shard_size = buffer.len() / self.data_shards;
+        let mut shards: Vec<Vec<u8>> = buffer
+            .chunks_exact(shard_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        for _ in 0..self.parity_shards {
+            shards.push(vec![0u8; shard_size]);
+        }
+
+        self.engine.encode(&mut shards)?;
         Ok(shards)
     }
 

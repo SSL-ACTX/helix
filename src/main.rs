@@ -86,7 +86,14 @@ fn main() -> Result<()> {
                 total_bytes += bytes_read as u64;
 
                 // Step A: Compression (Zstd) - Deterministic, do once per block
-                let mut compressed_payload = zstd::encode_all(chunk_data, 3)?;
+                // Stream compression to temp file to avoid holding multiple large buffers
+                let temp_path = std::env::temp_dir()
+                    .join(format!("helix_blk{}_{}.zst", block_id, rand::random::<u64>()));
+                let temp_file = File::create(&temp_path)?;
+                let mut encoder = zstd::Encoder::new(temp_file, 3)?;
+                encoder.write_all(chunk_data)?;
+                let temp_file = encoder.finish()?;
+                let compressed_len = temp_file.metadata()?.len() as usize;
 
                 // RETRY LOOP: Salt Rotation
                 // If the resulting DNA is unstable (high GC/bad Tm), we re-roll the Block Salt.
@@ -103,19 +110,11 @@ fn main() -> Result<()> {
                     rand::thread_rng().fill_bytes(&mut nonce_bytes);
                     rand::thread_rng().fill_bytes(&mut block_salt);
 
-                    if has_password {
-                        let session_key = crypto::derive_session_key(&master_key, &block_salt);
-                        let cipher = XChaCha20Poly1305::new(&session_key);
-                        let nonce = XNonce::from_slice(&nonce_bytes);
-
-                        let tag = cipher.encrypt_in_place_detached(nonce, b"", &mut compressed_payload)
-                            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-                        compressed_payload.extend_from_slice(tag.as_slice());
-                    }
+                    // Encryption is applied after payload is loaded into the master buffer
 
                     // Step C: Header Construction
                     // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
-                    let enc_len = compressed_payload.len();
+                    let enc_len = compressed_len + if has_password { 16 } else { 0 };
 
                     let mut header = (bytes_read as u64).to_be_bytes().to_vec();
                     header.extend_from_slice(&(enc_len as u64).to_be_bytes());
@@ -127,13 +126,37 @@ fn main() -> Result<()> {
                     hdr_hasher.update(&header);
                     let hdr_crc = hdr_hasher.finalize();
 
-                    let mut data_to_encode = header;
-                    data_to_encode.extend_from_slice(&hdr_crc.to_be_bytes());
-                    data_to_encode.extend_from_slice(&compressed_payload);
+                    let mut header_with_crc = header;
+                    header_with_crc.extend_from_slice(&hdr_crc.to_be_bytes());
+
+                    // Build padded master buffer: [header_with_crc][payload][tag]
+                    let total_len = header_with_crc.len() + enc_len;
+                    let shard_size = (total_len + *data - 1) / *data;
+                    let padded_len = shard_size * *data;
+                    let mut master_buffer = vec![0u8; padded_len];
+                    master_buffer[..header_with_crc.len()].copy_from_slice(&header_with_crc);
+
+                    // Read compressed payload into master buffer
+                    let mut temp_reader = File::open(&temp_path)?;
+                    let payload_offset = header_with_crc.len();
+                    let payload_end = payload_offset + compressed_len;
+                    temp_reader.read_exact(&mut master_buffer[payload_offset..payload_end])?;
+
+                    // Encrypt in place and append tag if needed
+                    if has_password {
+                        let session_key = crypto::derive_session_key(&master_key, &block_salt);
+                        let cipher = XChaCha20Poly1305::new(&session_key);
+                        let nonce = XNonce::from_slice(&nonce_bytes);
+                        let tag = cipher.encrypt_in_place_detached(nonce, b"", &mut master_buffer[payload_offset..payload_end])
+                            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+                        master_buffer[payload_end..payload_end + 16].copy_from_slice(tag.as_slice());
+                    }
+
+                    let _ = fs::remove_file(&temp_path);
 
                     // Step D: Reed-Solomon Encoding
                     let rs = RedundancyManager::new(*data, *parity)?;
-                    let shards = rs.encode_to_shards(&data_to_encode)?;
+                    let shards = rs.encode_from_padded_buffer(master_buffer)?;
 
                     // Step E: DNA Transcoding & Analysis (Parallel)
                     let results = ParallelProcessor::process_block(block_id, shards, primers);
@@ -159,7 +182,7 @@ fn main() -> Result<()> {
                     // Decision Logic
                     if unstable_count == 0 {
                         // Success! Write to disk.
-                        total_encoded_bytes += data_to_encode.len() as u64;
+                        total_encoded_bytes += total_len as u64;
                         for res in results {
                             output_file.write_all(res.fasta_entry.as_bytes())?;
                         }
@@ -169,7 +192,7 @@ fn main() -> Result<()> {
                         if attempts >= max_retries {
                             if *force {
                                 println!(" [WARNING: {} unstable strands. Force override used.] ", unstable_count);
-                                total_encoded_bytes += data_to_encode.len() as u64;
+                                total_encoded_bytes += total_len as u64;
                                 for res in results {
                                     output_file.write_all(res.fasta_entry.as_bytes())?;
                                 }
