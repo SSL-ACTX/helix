@@ -18,6 +18,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, BufRead, BufReader};
 use std::path::PathBuf;
 use std::collections::HashMap;
+use std::borrow::Cow;
 use anyhow::{Result, Context};
 use rand::RngCore;
 use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::Aead};
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
                     attempts += 1;
 
                     // Step B: Encryption (HKDF Session Key -> XChaCha20-Poly1305)
-                    let mut payload = compressed_payload.clone();
+                    let mut encrypted_payload: Option<Vec<u8>> = None;
                     let mut nonce_bytes = [0u8; 24];
                     let mut block_salt = [0u8; 16];
 
@@ -108,14 +109,21 @@ fn main() -> Result<()> {
                         let cipher = XChaCha20Poly1305::new(&session_key);
                         let nonce = XNonce::from_slice(&nonce_bytes);
 
-                        payload = cipher.encrypt(nonce, payload.as_ref())
+                        let ciphertext = cipher.encrypt(nonce, compressed_payload.as_ref())
                         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+                        encrypted_payload = Some(ciphertext);
                     }
 
                     // Step C: Header Construction
                     // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
+                    let enc_len = if let Some(ref ciphertext) = encrypted_payload {
+                        ciphertext.len()
+                    } else {
+                        compressed_payload.len()
+                    };
+
                     let mut header = (bytes_read as u64).to_be_bytes().to_vec();
-                    header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                    header.extend_from_slice(&(enc_len as u64).to_be_bytes());
                     header.extend_from_slice(&global_salt);
                     header.extend_from_slice(&block_salt);
                     header.extend_from_slice(&nonce_bytes);
@@ -126,7 +134,11 @@ fn main() -> Result<()> {
 
                     let mut data_to_encode = header;
                     data_to_encode.extend_from_slice(&hdr_crc.to_be_bytes());
-                    data_to_encode.extend_from_slice(&payload);
+                    if let Some(mut ciphertext) = encrypted_payload {
+                        data_to_encode.append(&mut ciphertext);
+                    } else {
+                        data_to_encode.extend_from_slice(&compressed_payload);
+                    }
 
                     // Step D: Reed-Solomon Encoding
                     let rs = RedundancyManager::new(*data, *parity)?;
@@ -309,10 +321,10 @@ fn main() -> Result<()> {
                                         // Corrupted length fields, skip
                                         continue;
                                     }
-                                    let mut payload = raw_block[76..payload_end].to_vec();
+                                    let payload_slice = &raw_block[76..payload_end];
 
                                     // Decryption
-                                    if let Some(pass) = password {
+                                    let payload_bytes: Cow<'_, [u8]> = if let Some(pass) = password {
                                         // Optimization: Only derive Master Key if needed
                                         if cached_master_key.is_none() {
                                             print!("[*] Deriving Master Key for decryption... ");
@@ -326,18 +338,20 @@ fn main() -> Result<()> {
 
                                         let cipher = XChaCha20Poly1305::new(&session_key);
                                         let nonce = XNonce::from_slice(nonce_bytes);
-                                        match cipher.decrypt(nonce, payload.as_ref()) {
-                                            Ok(p) => payload = p,
+                                        match cipher.decrypt(nonce, payload_slice) {
+                                            Ok(p) => Cow::Owned(p),
                                             Err(_) => {
                                                 anyhow::bail!("\n[!] SECURITY ERROR: Decryption failed for Block {}.", blk_id);
                                             }
                                         }
-                                    }
+                                    } else {
+                                        Cow::Borrowed(payload_slice)
+                                    };
 
                                     // Decompression (streamed to disk, bounded by orig_len)
                                     let recovered_path = temp_dir.join(format!("recovered_{}.bin", blk_id));
                                     let mut out = File::create(&recovered_path)?;
-                                    let decoder = zstd::Decoder::new(&payload[..])?;
+                                    let decoder = zstd::Decoder::new(payload_bytes.as_ref())?;
                                     let mut limited = decoder.take(orig_len as u64);
                                     io::copy(&mut limited, &mut out)?;
 
