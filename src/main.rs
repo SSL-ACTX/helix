@@ -276,13 +276,24 @@ fn main() -> Result<()> {
                                 if let Ok(raw_block) = rs.recover_file(rs_shards) {
                                     // Parse Binary Header
                                     // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [Payload...]
+                                    if raw_block.len() < 72 {
+                                        // Corrupted block, skip
+                                        continue;
+                                    }
+
                                     let orig_len = u64::from_be_bytes(raw_block[0..8].try_into()?) as usize;
                                     let enc_len = u64::from_be_bytes(raw_block[8..16].try_into()?) as usize;
 
                                     let global_salt = &raw_block[16..32];
                                     let block_salt = &raw_block[32..48];
                                     let nonce_bytes = &raw_block[48..72];
-                                    let mut payload = raw_block[72..72 + enc_len].to_vec();
+
+                                    let payload_end = 72usize.saturating_add(enc_len);
+                                    if payload_end > raw_block.len() {
+                                        // Corrupted length fields, skip
+                                        continue;
+                                    }
+                                    let mut payload = raw_block[72..payload_end].to_vec();
 
                                     // Decryption
                                     if let Some(pass) = password {
