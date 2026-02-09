@@ -87,14 +87,20 @@ impl ParallelProcessor {
         if parts.len() < 2 { return None; }
 
         let block_id: u32 = parts[0].strip_prefix("blk")?.parse().ok()?;
+        let header_index: Option<usize> = parts[1]
+            .strip_prefix("s")
+            .and_then(|v| v.parse::<usize>().ok());
 
         // 2. Strip Primers (FUZZY MODE)
         let (fp, _) = primers;
 
         // Critical Fix: Use Fuzzy Matching.
-        // Allow up to 3 errors in the 20bp primers (~15% tolerance).
+        // Allow up to 4 errors in the 20bp primers (~20% tolerance).
         // This ensures the strand reaches Viterbi even if the "Zip Code" is slightly damaged.
-        let core = Oligo::strip_tagged_fuzzy(dna, primers, 3)?;
+        let core = Oligo::strip_tagged_fuzzy(dna, primers, 4)?;
+
+        // Prefer the actual observed last base of the forward primer (mutations possible)
+        let actual_fp_last = dna.chars().nth(fp.len().saturating_sub(1)).unwrap_or('A');
 
         if core.len() < ADDRESS_BASE_LEN { return None; }
 
@@ -103,11 +109,11 @@ impl ParallelProcessor {
 
         // 3. Resolve Address Chain Start (Based on Forward Primer tail)
         let last_fp_char = fp.chars().last().unwrap_or('A');
-        let start_base_addr = Base::from_char(last_fp_char)?;
+        let start_base_addr = Base::from_char(actual_fp_last).or_else(|| Base::from_char(last_fp_char))?;
 
         // 4. Decode Address (With Viterbi Fallback)
         // We need the address to be valid to get the Index AND the start seed for payload.
-        let (index, corrected_address_str) = match DnaMapper::decode_shard(address_raw, start_base_addr) {
+        let (index_from_addr, corrected_address_str) = match DnaMapper::decode_shard(address_raw, start_base_addr) {
             Some(bytes) => {
                 // Fast Path: Address is clean
                 if bytes.len() < 4 { return None; }
@@ -123,6 +129,8 @@ impl ParallelProcessor {
                 (idx, healed_addr)
             }
         };
+
+        let index = header_index.unwrap_or(index_from_addr);
 
         // 5. Decode Payload (With Viterbi Fallback)
         // CRITICAL: Use the last char of the *Corrected* Address as seed.
@@ -155,8 +163,80 @@ impl ParallelProcessor {
         // If direct failed (Trellis violation OR CRC mismatch), try to heal.
         if let Some(healed_payload) = DnaMapper::viterbi_correct(payload_raw, start_base_payload) {
             if let Some(data) = try_decode_payload(&healed_payload) {
-                // Success: The Viterbi algorithm found the correct path!
                 return Some((block_id, index, data));
+            }
+        }
+
+        // Attempt C: If payload failed, try a Viterbi-healed address seed (if not already used)
+        if corrected_address_str == address_raw {
+            if let Some(healed_addr) = DnaMapper::viterbi_correct(address_raw, start_base_addr) {
+                let last_addr_char = healed_addr.chars().last().unwrap_or('A');
+                let alt_start_base_payload = Base::from_char(last_addr_char)?;
+                let try_decode_alt = |p_seq: &str| -> Option<Vec<u8>> {
+                    let bytes = DnaMapper::decode_shard(p_seq, alt_start_base_payload)?;
+                    if bytes.len() < 4 { return None; }
+                    let provided_crc = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+                    let actual_data = &bytes[4..];
+                    let mut hasher = Hasher::new();
+                    hasher.update(actual_data);
+                    if hasher.finalize() == provided_crc { Some(actual_data.to_vec()) } else { None }
+                };
+
+                if let Some(data) = try_decode_alt(payload_raw) {
+                    return Some((block_id, index, data));
+                }
+                if let Some(healed_payload) = DnaMapper::viterbi_correct(payload_raw, alt_start_base_payload) {
+                    if let Some(data) = try_decode_alt(&healed_payload) {
+                        return Some((block_id, index, data));
+                    }
+                }
+            }
+        }
+
+        // Attempt D: Brute-force payload seed with all bases (salvage cases with bad seeds)
+        for base in Base::all() {
+            if base == start_base_payload { continue; }
+            let try_decode_seed = |p_seq: &str| -> Option<Vec<u8>> {
+                let bytes = DnaMapper::decode_shard(p_seq, base)?;
+                if bytes.len() < 4 { return None; }
+                let provided_crc = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+                let actual_data = &bytes[4..];
+                let mut hasher = Hasher::new();
+                hasher.update(actual_data);
+                if hasher.finalize() == provided_crc { Some(actual_data.to_vec()) } else { None }
+            };
+
+            if let Some(data) = try_decode_seed(payload_raw) {
+                return Some((block_id, index, data));
+            }
+            if let Some(healed_payload) = DnaMapper::viterbi_correct(payload_raw, base) {
+                if let Some(data) = try_decode_seed(&healed_payload) {
+                    return Some((block_id, index, data));
+                }
+            }
+        }
+
+        // Attempt E: If address decode failed but header index exists, brute-force payload seed
+        if header_index.is_some() && DnaMapper::decode_shard(address_raw, start_base_addr).is_none() {
+            for base in Base::all() {
+                let try_decode_seed = |p_seq: &str| -> Option<Vec<u8>> {
+                    let bytes = DnaMapper::decode_shard(p_seq, base)?;
+                    if bytes.len() < 4 { return None; }
+                    let provided_crc = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+                    let actual_data = &bytes[4..];
+                    let mut hasher = Hasher::new();
+                    hasher.update(actual_data);
+                    if hasher.finalize() == provided_crc { Some(actual_data.to_vec()) } else { None }
+                };
+
+                if let Some(data) = try_decode_seed(payload_raw) {
+                    return Some((block_id, index, data));
+                }
+                if let Some(healed_payload) = DnaMapper::viterbi_correct(payload_raw, base) {
+                    if let Some(data) = try_decode_seed(&healed_payload) {
+                        return Some((block_id, index, data));
+                    }
+                }
             }
         }
 
