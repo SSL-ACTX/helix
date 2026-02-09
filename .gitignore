@@ -12,3 +12,4 @@ __pycache__/
 bak/
 output.*
 *.jpg
+dist/
