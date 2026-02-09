@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::borrow::Cow;
 use anyhow::{Result, Context};
 use rand::RngCore;
-use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::Aead};
+use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::AeadInPlace};
 use crc32fast::Hasher;
 
 fn main() -> Result<()> {
@@ -86,7 +86,7 @@ fn main() -> Result<()> {
                 total_bytes += bytes_read as u64;
 
                 // Step A: Compression (Zstd) - Deterministic, do once per block
-                let compressed_payload = zstd::encode_all(chunk_data, 3)?;
+                let mut compressed_payload = zstd::encode_all(chunk_data, 3)?;
 
                 // RETRY LOOP: Salt Rotation
                 // If the resulting DNA is unstable (high GC/bad Tm), we re-roll the Block Salt.
@@ -96,7 +96,6 @@ fn main() -> Result<()> {
                     attempts += 1;
 
                     // Step B: Encryption (HKDF Session Key -> XChaCha20-Poly1305)
-                    let mut encrypted_payload: Option<Vec<u8>> = None;
                     let mut nonce_bytes = [0u8; 24];
                     let mut block_salt = [0u8; 16];
 
@@ -109,18 +108,14 @@ fn main() -> Result<()> {
                         let cipher = XChaCha20Poly1305::new(&session_key);
                         let nonce = XNonce::from_slice(&nonce_bytes);
 
-                        let ciphertext = cipher.encrypt(nonce, compressed_payload.as_ref())
-                        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
-                        encrypted_payload = Some(ciphertext);
+                        let tag = cipher.encrypt_in_place_detached(nonce, b"", &mut compressed_payload)
+                            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+                        compressed_payload.extend_from_slice(tag.as_slice());
                     }
 
                     // Step C: Header Construction
                     // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
-                    let enc_len = if let Some(ref ciphertext) = encrypted_payload {
-                        ciphertext.len()
-                    } else {
-                        compressed_payload.len()
-                    };
+                    let enc_len = compressed_payload.len();
 
                     let mut header = (bytes_read as u64).to_be_bytes().to_vec();
                     header.extend_from_slice(&(enc_len as u64).to_be_bytes());
@@ -134,11 +129,7 @@ fn main() -> Result<()> {
 
                     let mut data_to_encode = header;
                     data_to_encode.extend_from_slice(&hdr_crc.to_be_bytes());
-                    if let Some(mut ciphertext) = encrypted_payload {
-                        data_to_encode.append(&mut ciphertext);
-                    } else {
-                        data_to_encode.extend_from_slice(&compressed_payload);
-                    }
+                    data_to_encode.extend_from_slice(&compressed_payload);
 
                     // Step D: Reed-Solomon Encoding
                     let rs = RedundancyManager::new(*data, *parity)?;
@@ -338,8 +329,16 @@ fn main() -> Result<()> {
 
                                         let cipher = XChaCha20Poly1305::new(&session_key);
                                         let nonce = XNonce::from_slice(nonce_bytes);
-                                        match cipher.decrypt(nonce, payload_slice) {
-                                            Ok(p) => Cow::Owned(p),
+                                        if payload_slice.len() < 16 {
+                                            anyhow::bail!("\n[!] SECURITY ERROR: Truncated payload for Block {}.", blk_id);
+                                        }
+                                        let mut buffer = payload_slice.to_vec();
+                                        let tag_offset = buffer.len() - 16;
+                                        let tag_bytes = buffer[tag_offset..].to_vec();
+                                        let tag = chacha20poly1305::Tag::from_slice(&tag_bytes);
+                                        buffer.truncate(tag_offset);
+                                        match cipher.decrypt_in_place_detached(nonce, b"", &mut buffer, tag) {
+                                            Ok(()) => Cow::Owned(buffer),
                                             Err(_) => {
                                                 anyhow::bail!("\n[!] SECURITY ERROR: Decryption failed for Block {}.", blk_id);
                                             }
