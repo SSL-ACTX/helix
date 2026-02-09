@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use anyhow::{Result, Context};
 use rand::RngCore;
 use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::Aead};
+use crc32fast::Hasher;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -112,12 +113,19 @@ fn main() -> Result<()> {
                     }
 
                     // Step C: Header Construction
-                    // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [Payload...]
-                    let mut data_to_encode = (bytes_read as u64).to_be_bytes().to_vec();
-                    data_to_encode.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-                    data_to_encode.extend_from_slice(&global_salt);
-                    data_to_encode.extend_from_slice(&block_salt);
-                    data_to_encode.extend_from_slice(&nonce_bytes);
+                    // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
+                    let mut header = (bytes_read as u64).to_be_bytes().to_vec();
+                    header.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                    header.extend_from_slice(&global_salt);
+                    header.extend_from_slice(&block_salt);
+                    header.extend_from_slice(&nonce_bytes);
+
+                    let mut hdr_hasher = Hasher::new();
+                    hdr_hasher.update(&header);
+                    let hdr_crc = hdr_hasher.finalize();
+
+                    let mut data_to_encode = header;
+                    data_to_encode.extend_from_slice(&hdr_crc.to_be_bytes());
                     data_to_encode.extend_from_slice(&payload);
 
                     // Step D: Reed-Solomon Encoding
@@ -275,8 +283,8 @@ fn main() -> Result<()> {
                                 let rs = RedundancyManager::new(*data, *parity)?;
                                 if let Ok(raw_block) = rs.recover_file(rs_shards) {
                                     // Parse Binary Header
-                                    // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [Payload...]
-                                    if raw_block.len() < 72 {
+                                    // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [HdrCRC 4] [Payload...]
+                                    if raw_block.len() < 76 {
                                         // Corrupted block, skip
                                         continue;
                                     }
@@ -287,13 +295,21 @@ fn main() -> Result<()> {
                                     let global_salt = &raw_block[16..32];
                                     let block_salt = &raw_block[32..48];
                                     let nonce_bytes = &raw_block[48..72];
+                                    let hdr_crc = u32::from_be_bytes(raw_block[72..76].try_into()?);
 
-                                    let payload_end = 72usize.saturating_add(enc_len);
+                                    let mut hdr_hasher = Hasher::new();
+                                    hdr_hasher.update(&raw_block[0..72]);
+                                    if hdr_hasher.finalize() != hdr_crc {
+                                        // Corrupted header, skip
+                                        continue;
+                                    }
+
+                                    let payload_end = 76usize.saturating_add(enc_len);
                                     if payload_end > raw_block.len() {
                                         // Corrupted length fields, skip
                                         continue;
                                     }
-                                    let mut payload = raw_block[72..payload_end].to_vec();
+                                    let mut payload = raw_block[76..payload_end].to_vec();
 
                                     // Decryption
                                     if let Some(pass) = password {
