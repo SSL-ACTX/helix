@@ -72,3 +72,32 @@ impl RedundancyManager {
         Ok(recovered)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RedundancyManager;
+
+    #[test]
+    fn encode_produces_expected_shard_sizes() {
+        let rs = RedundancyManager::new(3, 2).expect("rs init failed");
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let shards = rs.encode_to_shards(&data).expect("encode failed");
+        assert_eq!(shards.len(), 5);
+        for shard in shards {
+            assert_eq!(shard.len(), 4);
+        }
+    }
+
+    #[test]
+    fn recover_with_missing_shard() {
+        let rs = RedundancyManager::new(4, 2).expect("rs init failed");
+        let data = b"redundancy-test".to_vec();
+        let shards = rs.encode_to_shards(&data).expect("encode failed");
+
+        let mut missing: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        missing[1] = None;
+
+        let recovered = rs.recover_file(missing).expect("recover failed");
+        assert_eq!(&recovered[..data.len()], &data[..]);
+    }
+}

@@ -2,7 +2,7 @@
 
 ![Helix Banner](https://capsule-render.vercel.app/api?type=waving&color=0:121212,100:00ff&height=220&section=header&text=Helix&fontSize=90&fontColor=FFFFFF&animation=fadeIn&fontAlignY=35&rotate=-2&stroke=00ffff&strokeWidth=2&desc=Systems-Level%20DNA%20Storage%20Archiver&descSize=20&descAlignY=60)
 
-[![License: MIT](https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=for-the-badge&logo=open-source-initiative)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-AGPL_3.0-blue.svg?style=for-the-badge&logo=open-source-initiative)](https://opensource.org/licenses/AGPL-3.0)
 [![Language](https://img.shields.io/badge/Rust-Latest-orange.svg?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/Status-Research%20Prototype-yellow.svg?style=for-the-badge)]()
 [![Tests](https://img.shields.io/badge/Tests-Passed-success.svg?style=for-the-badge)]()
@@ -11,7 +11,7 @@
 
 > **A Systems-Level DNA Storage Archiver written in Rust.**
 > 
-> *Streaming I/O • AES-256-GCM • Reed-Solomon (N+K) • Viterbi Correction*
+> *Streaming I/O • XChaCha20-Poly1305 • Reed-Solomon (N+K) • Viterbi Correction*
 
 **Helix** is a high-performance compiler designed to bridge the gap between binary data and biological storage. It transforms digital files into **biostable DNA oligonucleotides** formatted for synthesis and deep-time archival.
 
@@ -42,7 +42,7 @@ Unlike simple transcoders, Helix implements a full "Systems Storage" stack, hand
 
 ### 🛡️ Security & Resilience
 * **Cryptographic Access:** * **Argon2id** for Master Key derivation (memory-hard).
-    * **HKDF + AES-GCM** for per-block session keys. A unique nonce and salt for every block means identical files produce completely different DNA streams.
+    * **HKDF + XChaCha20-Poly1305** for per-block session keys. A unique nonce and salt for every block means identical files produce completely different DNA streams.
 * **Multi-Layer Error Correction:**
     * **Reed-Solomon (Erasure Coding):** Configurable redundancy (Default: 10 Data + 5 Parity) recovers files even if **33%** of strands are completely lost.
     * **Viterbi Decoder (Mutation Correction):** Treats DNA as a "Noisy Channel." If a strand fails integrity checks, the Viterbi engine finds the optimal path through the trellis to "heal" substitution errors, recovering data from strands with ~1.0% mutation rates.
@@ -59,7 +59,7 @@ Unlike simple transcoders, Helix implements a full "Systems Storage" stack, hand
 The Helix Pipeline operates on **4MB independent blocks**, transforming binary data through 5 distinct layers:
 
 1.  **L1 - Stream & Compress:** The file is read in buffered 4MB chunks and compressed via Zstd.
-2.  **L2 - Encryption:** The compressed chunk is encrypted (AES-256-GCM) using a unique nonce and salt per block. *Note: If stability checks fail, this step is re-run with a new salt.*
+2.  **L2 - Encryption:** The compressed chunk is encrypted (XChaCha20-Poly1305) using a unique nonce and salt per block. *Note: If stability checks fail, this step is re-run with a new salt.*
 3.  **L3 - Redundancy:** The blob is split into $N$ data shards. $K$ parity shards are generated using Galois Field arithmetic (Reed-Solomon).
 4.  **L4 - Transcoding:** * Each shard is prepended with a CRC32 checksum.
     * Binary data is mapped to DNA bases using the constrained trellis.

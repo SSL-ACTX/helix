@@ -100,3 +100,35 @@ impl<R: BufRead> Iterator for DnaBatchIterator<R> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DnaBatchIterator;
+    use std::io::Cursor;
+
+    #[test]
+    fn parses_multiline_fasta_and_batches() {
+        let fasta = ">h0
+    >h1
+    ACG
+    TT
+    >h2
+    GG
+    CC
+    ";
+        let reader = Cursor::new(fasta.as_bytes());
+        let mut iter = DnaBatchIterator::new(reader, 1, 1024);
+
+        let batch1 = iter.next().unwrap().unwrap();
+        assert_eq!(batch1.len(), 1);
+        assert_eq!(batch1[0].0, ">h1");
+        assert_eq!(batch1[0].1, "ACGTT");
+
+        let batch2 = iter.next().unwrap().unwrap();
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(batch2[0].0, ">h2");
+        assert_eq!(batch2[0].1, "GGCC");
+
+        assert!(iter.next().is_none());
+    }
+}

@@ -16,7 +16,7 @@ Helix processes data in **Streaming Mode**. It does not load the entire file int
 | Layer | Action | Algorithm | Rationale |
 | :--- | :--- | :--- | :--- |
 | **L1** | **Compress** | Zstandard (Level 3) | Increases logical density to offset the physical redundancy overhead. |
-| **L2** | **Encrypt** | AES-256-GCM + Argon2id | Ensures privacy and prevents "Known Plaintext" attacks on the DNA structure. |
+| **L2** | **Encrypt** | XChaCha20-Poly1305 + Argon2id | Ensures privacy and prevents "Known Plaintext" attacks on the DNA structure. |
 | **L3** | **Redundancy** | Reed-Solomon ($GF(2^8)$) | Mathematical guarantee of recovery against strand loss (Dropout). |
 | **L4** | **Transcode** | Base-3 Rotating Trellis | Enforces biological constraints (No homopolymers, Balanced GC). |
 | **L5** | **Address** | PCR Primers + Index | Physical addressing allowing $O(1)$ chemical retrieval. |
@@ -30,8 +30,8 @@ Helix processes data in **Streaming Mode**. It does not load the entire file int
 * **Alternative:** Luby Transform (LT) / Fountain Codes.
 * **Reasoning:** Fountain codes are probabilistic; you need ~110% of symbols to have a *high probability* of recovery. Reed-Solomon is **deterministic**. If you have $N$ shards, you recover the file. Period. In archival storage, we prefer mathematical certainty over probabilistic efficiency.
 
-### Why Argon2id + AES-GCM?
-* **Decision:** Argon2id for Key Derivation, AES-256-GCM for Encryption.
+### Why Argon2id + XChaCha20-Poly1305?
+* **Decision:** Argon2id for Key Derivation, XChaCha20-Poly1305 for Encryption.
 * **Reasoning:**
     1.  **Time Capsule Security:** DNA lasts 100+ years. Computing power will increase exponentially. Standard hashing (SHA-256) will be trivial to brute-force in 2050. Argon2id is **Memory-Hard**, resisting future GPU/ASIC cracking.
     2.  **Integrity:** GCM Mode provides an authentication tag. If a strand is mutated into a valid-looking but incorrect byte sequence, the GCM tag verification will fail, preventing silent data corruption.
@@ -78,7 +78,7 @@ Before becoming DNA, every encrypted block is prefixed with a binary header to a
 [ EncLen  (8 bytes) ]  -- Encrypted Payload Size
 [ G-Salt (16 bytes) ]  -- Global Salt (for Argon2id Master Key)
 [ B-Salt (16 bytes) ]  -- Block Salt (for HKDF Session Key)
-[ Nonce  (12 bytes) ]  -- AES-GCM Nonce (Unique per block)
+[ Nonce  (24 bytes) ]  -- XChaCha20-Poly1305 Nonce (Unique per block)
 [ ... Payload ...   ]  -- The Encrypted Data
 
 ```

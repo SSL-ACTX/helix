@@ -202,3 +202,56 @@ impl ParallelProcessor {
         .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ParallelProcessor;
+    use crate::oligo::{DEFAULT_FP, DEFAULT_RP};
+
+    #[test]
+    fn process_block_and_parse_strand_roundtrip() {
+        let primers = (DEFAULT_FP, DEFAULT_RP);
+        let shard = b"payload-data".to_vec();
+        let results = ParallelProcessor::process_block(0, vec![shard.clone()], primers);
+        assert_eq!(results.len(), 1);
+
+        let fasta = &results[0].fasta_entry;
+        let mut lines = fasta.lines();
+        let header = lines.next().expect("missing header");
+        let dna = lines.next().expect("missing dna");
+
+        let parsed = ParallelProcessor::parse_strand(header, dna, primers)
+            .expect("parse failed");
+        assert_eq!(parsed.0, 0);
+        assert_eq!(parsed.1, 0);
+        assert_eq!(parsed.2, shard);
+    }
+
+    #[test]
+    fn search_soup_batch_filters_by_primers() {
+        let primers = (DEFAULT_FP, DEFAULT_RP);
+        let keep = format!("{}{}{}", DEFAULT_FP, "AAA", DEFAULT_RP);
+        let drop = "ACGTACGT".to_string();
+
+        let batch = vec![
+            (">h1".to_string(), keep),
+            (">h2".to_string(), drop),
+        ];
+
+        let results = ParallelProcessor::search_soup_batch(&batch, primers);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains(">h1"));
+    }
+
+    #[test]
+    fn decay_batch_noop_when_rates_zero() {
+        let batch = vec![
+            (">h1".to_string(), "ACGT".to_string()),
+            (">h2".to_string(), "TGCA".to_string()),
+        ];
+        let results = ParallelProcessor::process_decay_batch(batch, 0.0, 0.0);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], ">h1\nACGT");
+        assert_eq!(results[1], ">h2\nTGCA");
+    }
+}

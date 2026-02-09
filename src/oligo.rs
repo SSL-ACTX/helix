@@ -119,3 +119,59 @@ impl Oligo {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Oligo, ADDRESS_BASE_LEN, DEFAULT_FP, DEFAULT_RP};
+
+    fn mutate_first_char(s: &str) -> String {
+        let mut chars: Vec<char> = s.chars().collect();
+        if let Some(c) = chars.first_mut() {
+            *c = match *c {
+                'A' => 'C',
+                'C' => 'G',
+                'G' => 'T',
+                'T' => 'A',
+                _ => 'A',
+            };
+        }
+        chars.into_iter().collect()
+    }
+
+    #[test]
+    fn default_primers_are_used() {
+        let (fp, rp) = Oligo::get_primers_for_tag("default");
+        assert_eq!(fp, DEFAULT_FP);
+        assert_eq!(rp, DEFAULT_RP);
+    }
+
+    #[test]
+    fn resolve_primers_respects_overrides() {
+        let (fp, rp) = Oligo::resolve_primers("default", Some("AAAA"), None);
+        assert_eq!(fp, "AAAA");
+        assert_eq!(rp, DEFAULT_RP);
+    }
+
+    #[test]
+    fn create_and_strip_tagged_exact() {
+        let primers = (DEFAULT_FP, DEFAULT_RP);
+        let payload = vec![1u8, 2, 3, 4];
+        let strand = Oligo::create_tagged(7, &payload, primers);
+        assert!(strand.starts_with(DEFAULT_FP));
+        assert!(strand.ends_with(DEFAULT_RP));
+
+        let core = Oligo::strip_tagged_exact(&strand, primers).expect("strip exact failed");
+        let expected_payload_len = payload.len() * 6;
+        assert_eq!(core.len(), ADDRESS_BASE_LEN + expected_payload_len);
+    }
+
+    #[test]
+    fn strip_tagged_fuzzy_tolerates_errors() {
+        let primers = (DEFAULT_FP, DEFAULT_RP);
+        let payload = vec![9u8, 8, 7];
+        let strand = Oligo::create_tagged(3, &payload, primers);
+        let mutated = mutate_first_char(&strand);
+        let core = Oligo::strip_tagged_fuzzy(&mutated, primers, 1).expect("fuzzy strip failed");
+        assert!(!core.is_empty());
+    }
+}

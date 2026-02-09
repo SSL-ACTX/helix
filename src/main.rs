@@ -14,12 +14,13 @@ use helix::oligo::Oligo;
 use crate::cli::{Cli, Commands};
 
 use clap::Parser;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write, BufRead, BufReader};
-use std::collections::{HashMap, BTreeMap};
+use std::path::PathBuf;
+use std::collections::HashMap;
 use anyhow::{Result, Context};
 use rand::RngCore;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+use chacha20poly1305::{XChaCha20Poly1305, KeyInit, XNonce, aead::Aead};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -92,9 +93,9 @@ fn main() -> Result<()> {
                 loop {
                     attempts += 1;
 
-                    // Step B: Encryption (HKDF Session Key -> AES-256-GCM)
+                    // Step B: Encryption (HKDF Session Key -> XChaCha20-Poly1305)
                     let mut payload = compressed_payload.clone();
-                    let mut nonce_bytes = [0u8; 12];
+                    let mut nonce_bytes = [0u8; 24];
                     let mut block_salt = [0u8; 16];
 
                     // Generate FRESH salts for this attempt
@@ -103,15 +104,15 @@ fn main() -> Result<()> {
 
                     if has_password {
                         let session_key = crypto::derive_session_key(&master_key, &block_salt);
-                        let cipher = Aes256Gcm::new(&session_key);
-                        let nonce = Nonce::from_slice(&nonce_bytes);
+                        let cipher = XChaCha20Poly1305::new(&session_key);
+                        let nonce = XNonce::from_slice(&nonce_bytes);
 
                         payload = cipher.encrypt(nonce, payload.as_ref())
                         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
                     }
 
                     // Step C: Header Construction
-                    // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 12] [Payload...]
+                    // Format: [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [Payload...]
                     let mut data_to_encode = (bytes_read as u64).to_be_bytes().to_vec();
                     data_to_encode.extend_from_slice(&(payload.len() as u64).to_be_bytes());
                     data_to_encode.extend_from_slice(&global_salt);
@@ -198,12 +199,16 @@ fn main() -> Result<()> {
             let reader = BufReader::new(input_file);
             let mut output_file = File::create(output).context("Failed to create output file")?;
 
-            // Streaming State
-            let mut active_blocks: HashMap<u32, HashMap<usize, Vec<u8>>> = HashMap::new();
-            let mut decoded_buffer: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+            // Streaming State (disk-backed)
+            let mut shard_counts: HashMap<u32, usize> = HashMap::new();
+            let mut recovered_blocks: HashMap<u32, PathBuf> = HashMap::new();
             let mut next_expected_block = 0u32;
             let mut shards_found = 0;
             let mut blocks_recovered = 0;
+
+            // Temp spool directory for shards and recovered blocks
+            let temp_dir = PathBuf::from(format!("{}.helix_tmp", output));
+            fs::create_dir_all(&temp_dir)?;
 
             // Cache for Master Key to avoid re-deriving per block
             let mut cached_master_key: Option<[u8; 32]> = None;
@@ -218,28 +223,47 @@ fn main() -> Result<()> {
                         shards_found += 1;
 
                         if blk_id >= next_expected_block {
-                            active_blocks.entry(blk_id).or_default().insert(idx, data_shard);
+                            // Spool shard to disk to avoid RAM growth
+                            let block_dir = temp_dir.join(format!("block_{}", blk_id));
+                            fs::create_dir_all(&block_dir)?;
+                            let shard_path = block_dir.join(format!("shard_{}.bin", idx));
 
-                            let block_shards = active_blocks.get(&blk_id).unwrap();
+                            let wrote_new = match OpenOptions::new().write(true).create_new(true).open(&shard_path) {
+                                Ok(mut f) => {
+                                    f.write_all(&data_shard)?;
+                                    true
+                                }
+                                Err(_) => false, // Duplicate shard, ignore
+                            };
+
+                            if wrote_new {
+                                let counter = shard_counts.entry(blk_id).or_insert(0);
+                                *counter += 1;
+                            }
 
                             // Check if we have enough shards to trigger Reed-Solomon
-                            if block_shards.len() >= *data {
+                            if shard_counts.get(&blk_id).copied().unwrap_or(0) >= *data {
                                 let mut rs_shards = Vec::new();
                                 for i in 0..(*data + *parity) {
-                                    rs_shards.push(block_shards.get(&i).cloned());
+                                    let path = block_dir.join(format!("shard_{}.bin", i));
+                                    let shard = match fs::read(&path) {
+                                        Ok(bytes) => Some(bytes),
+                                        Err(_) => None,
+                                    };
+                                    rs_shards.push(shard);
                                 }
 
                                 let rs = RedundancyManager::new(*data, *parity)?;
                                 if let Ok(raw_block) = rs.recover_file(rs_shards) {
                                     // Parse Binary Header
-                                    // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 12] [Payload...]
+                                    // [OrigLen 8] [EncLen 8] [GlobalSalt 16] [BlockSalt 16] [Nonce 24] [Payload...]
                                     let orig_len = u64::from_be_bytes(raw_block[0..8].try_into()?) as usize;
                                     let enc_len = u64::from_be_bytes(raw_block[8..16].try_into()?) as usize;
 
                                     let global_salt = &raw_block[16..32];
                                     let block_salt = &raw_block[32..48];
-                                    let nonce_bytes = &raw_block[48..60];
-                                    let mut payload = raw_block[60..60 + enc_len].to_vec();
+                                    let nonce_bytes = &raw_block[48..72];
+                                    let mut payload = raw_block[72..72 + enc_len].to_vec();
 
                                     // Decryption
                                     if let Some(pass) = password {
@@ -254,8 +278,8 @@ fn main() -> Result<()> {
                                         let master_key = cached_master_key.unwrap();
                                         let session_key = crypto::derive_session_key(&master_key, block_salt);
 
-                                        let cipher = Aes256Gcm::new(&session_key);
-                                        let nonce = Nonce::from_slice(nonce_bytes);
+                                        let cipher = XChaCha20Poly1305::new(&session_key);
+                                        let nonce = XNonce::from_slice(nonce_bytes);
                                         match cipher.decrypt(nonce, payload.as_ref()) {
                                             Ok(p) => payload = p,
                                             Err(_) => {
@@ -264,20 +288,28 @@ fn main() -> Result<()> {
                                         }
                                     }
 
-                                    // Decompression
-                                    let decompressed = zstd::decode_all(&*payload)?;
-                                    let final_data = decompressed[..orig_len].to_vec();
+                                    // Decompression (streamed to disk, bounded by orig_len)
+                                    let recovered_path = temp_dir.join(format!("recovered_{}.bin", blk_id));
+                                    let mut out = File::create(&recovered_path)?;
+                                    let decoder = zstd::Decoder::new(&payload[..])?;
+                                    let mut limited = decoder.take(orig_len as u64);
+                                    io::copy(&mut limited, &mut out)?;
 
-                                    decoded_buffer.insert(blk_id, final_data);
-                                    active_blocks.remove(&blk_id);
+                                    // Cleanup shards on disk
+                                    let _ = fs::remove_dir_all(&block_dir);
+                                    shard_counts.remove(&blk_id);
+
+                                    recovered_blocks.insert(blk_id, recovered_path);
                                     blocks_recovered += 1;
 
                                     print!("\r    -> Recovered Block {} ({} bytes)... ", blk_id, orig_len);
                                     io::stdout().flush()?;
 
                                     // Write ordered blocks to disk
-                                    while let Some(ready_data) = decoded_buffer.remove(&next_expected_block) {
-                                        output_file.write_all(&ready_data)?;
+                                    while let Some(path) = recovered_blocks.remove(&next_expected_block) {
+                                        let mut f = File::open(&path)?;
+                                        io::copy(&mut f, &mut output_file)?;
+                                        let _ = fs::remove_file(&path);
                                         next_expected_block += 1;
                                     }
                                 }
@@ -294,16 +326,18 @@ fn main() -> Result<()> {
                 anyhow::bail!("[!] MATCH FAILURE: File contains data, but no strands matched the provided Primers/Tag. Check your credentials.");
             }
 
-            if !active_blocks.is_empty() {
-                let corrupted_ids: Vec<_> = active_blocks.keys().collect();
+            if !shard_counts.is_empty() {
+                let corrupted_ids: Vec<_> = shard_counts.keys().collect();
                 println!("\n[!] PARTIAL DATA: Found fragments of blocks {:?} but not enough to recover.", corrupted_ids);
                 anyhow::bail!("[!] CATASTROPHIC FAILURE: Insufficient redundancy. Data is lost.");
             }
 
-            if !decoded_buffer.is_empty() {
-                let stuck_ids: Vec<_> = decoded_buffer.keys().collect();
+            if !recovered_blocks.is_empty() {
+                let stuck_ids: Vec<_> = recovered_blocks.keys().collect();
                 anyhow::bail!("\n[!] SEQUENCE GAP: Recovered blocks {:?} but missing preceding Block {}. Stream is broken.", stuck_ids, next_expected_block);
             }
+
+            let _ = fs::remove_dir_all(&temp_dir);
 
             println!("[✔] Restoration Complete: {} blocks written to {}.", blocks_recovered, output);
         }

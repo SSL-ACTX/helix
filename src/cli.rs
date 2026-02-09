@@ -50,7 +50,7 @@ pub enum Commands {
         #[arg(long, value_name = "SEQ")]
         primer_rev: Option<String>,
 
-        /// Encryption password (AES-256-GCM)
+        /// Encryption password (XChaCha20-Poly1305)
         #[arg(long, value_name = "PASSWORD")]
         password: Option<String>,
 

@@ -235,3 +235,67 @@ impl DnaMapper {
         StabilityReport { gc_content, melting_temp, is_stable }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Base, DnaMapper};
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let data = vec![0u8, 1, 2, 3, 127, 254, 255];
+        let dna = DnaMapper::encode_shard(&data, Base::A);
+        let decoded = DnaMapper::decode_shard(&dna, Base::A).expect("decode failed");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn encoded_dna_has_no_homopolymers() {
+        let data = vec![42u8; 16];
+        let dna = DnaMapper::encode_shard(&data, Base::C);
+        let mut prev: Option<char> = None;
+        for c in dna.chars() {
+            if let Some(p) = prev {
+                assert_ne!(p, c);
+            }
+            prev = Some(c);
+        }
+    }
+
+    #[test]
+    fn viterbi_correction_recovers_payload() {
+        let data = b"hello-world".to_vec();
+        let dna = DnaMapper::encode_shard(&data, Base::G);
+
+        let mut chars: Vec<char> = dna.chars().collect();
+        if let Some(first) = chars.get_mut(3) {
+            *first = match *first {
+                'A' => 'C',
+                'C' => 'G',
+                'G' => 'T',
+                'T' => 'A',
+                _ => 'A',
+            };
+        }
+        let mutated: String = chars.into_iter().collect();
+
+        let healed = DnaMapper::viterbi_correct(&mutated, Base::G).expect("viterbi failed");
+        let decoded = DnaMapper::decode_shard(&healed, Base::G).expect("decode healed failed");
+        assert_eq!(decoded.len(), data.len());
+
+        let mut prev: Option<char> = None;
+        for c in healed.chars() {
+            if let Some(p) = prev {
+                assert_ne!(p, c);
+            }
+            prev = Some(c);
+        }
+    }
+
+    #[test]
+    fn stability_analysis_flags_balanced_sequence() {
+        let dna = "ACGTACGTACGTACGTACGT"; // 50% GC, length 20
+        let report = DnaMapper::analyze_stability(dna);
+        assert!(report.gc_content > 45.0 && report.gc_content < 55.0);
+        assert!(report.is_stable);
+    }
+}
